@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Marker shape QComboBox: QGIS marker previews in a wrapping grid (custom popup — no Qt list scrollbar)."""
 
+import inspect
 import os
 
 from qgis.PyQt.QtCore import QEvent, QMetaObject, QPoint, QRect, QSize, Qt, pyqtSlot
@@ -186,95 +187,34 @@ def coerce_marker_shape_for_setshape(shape_like):
     return _legacy_shape_value_from_int(iv)
 
 
-def _preferred_shape_keys():
-    """Encoded shape names for circle / square / diamond (ordering + fallbacks)."""
-    keys = []
-    if _HAVE_QGIS_MARKER_SHAPE:
-        for attr in ("Circle", "Square", "Diamond"):
-            v = getattr(Qgis.MarkerShape, attr, None)
-            if v is None:
-                continue
-            try:
-                k = QgsSimpleMarkerSymbolLayer.encodeShape(v)
-                if k:
-                    keys.append(str(k))
-            except Exception:
-                continue
-        if len(keys) == 3:
-            return tuple(keys)
-    for name in ("ShapeCircle", "ShapeSquare", "ShapeDiamond"):
-        v = getattr(QgsSimpleMarkerSymbolLayer, name, None)
-        if v is None:
-            continue
-        try:
-            k = QgsSimpleMarkerSymbolLayer.encodeShape(v)
-            if k:
-                keys.append(str(k))
-        except Exception:
-            continue
-    if keys:
-        return tuple(keys)
-    return ("circle", "square", "diamond")
-
-
-def _fallback_shape_keys():
-    """When availableShapes() is empty or fails: enumerate known marker shape constants."""
-    seen = set()
-    keys = []
-
-    def add_native(native):
-        try:
-            k = str(QgsSimpleMarkerSymbolLayer.encodeShape(native))
-        except Exception:
-            return
-        if k and k not in seen:
-            seen.add(k)
-            keys.append(k)
-            _register_native_marker_shape(native)
-
-    if _HAVE_QGIS_MARKER_SHAPE:
-        try:
-            for x in Qgis.MarkerShape:
-                add_native(x)
-        except Exception:
-            pass
-        if keys:
-            return _finalize_shape_key_order(keys)
-
-    classes = [QgsSimpleMarkerSymbolLayer]
+def _native_dedupe_key(native):
+    """QGIS 3.6.1: int(sip enum) can collapse; encodeShape can return duplicates — fall back to object id."""
     try:
-        from qgis.core import QgsSimpleMarkerSymbolLayerBase as _B
-
-        classes.insert(0, _B)
-    except ImportError:
+        s = str(QgsSimpleMarkerSymbolLayer.encodeShape(native))
+        if s:
+            return ("e", s)
+    except Exception:
         pass
-    for cls in classes:
-        for name in dir(cls):
-            if not name.startswith("Shape"):
-                continue
-            if name.startswith("ShapeIs") or name in ("Shape", "Shapes"):
-                continue
-            ev = getattr(cls, name, None)
-            if ev is None:
-                continue
-            add_native(ev)
-    ordered = _finalize_shape_key_order(keys)
-    return ordered if ordered else list(_preferred_shape_keys())
+    return ("id", id(native))
 
 
-def _finalize_shape_key_order(keys):
-    """Circle, square, diamond first (when present); remaining keys sorted."""
-    if not keys:
-        return []
-    seen_all = {str(k) for k in keys}
-    head = [p for p in _preferred_shape_keys() if p in seen_all]
-    head_set = set(head)
-    tail = sorted([str(k) for k in keys if str(k) not in head_set])
-    return head + tail
+def _natives_semantically_equal(a, b):
+    if a is b:
+        return True
+    try:
+        sa = str(QgsSimpleMarkerSymbolLayer.encodeShape(a))
+        sb = str(QgsSimpleMarkerSymbolLayer.encodeShape(b))
+        if sa and sb and sa == sb:
+            return True
+    except Exception:
+        pass
+    try:
+        return int(a) == int(b)
+    except Exception:
+        return False
 
 
-def _ordered_shape_keys():
-    """Unique encoded-shape keys for the combo (QGIS 3.6: int(sip enum) is unreliable; encodeShape is stable)."""
+def _available_shapes_raw():
     raw = []
     Base = None
     try:
@@ -288,31 +228,127 @@ def _ordered_shape_keys():
         if not callable(fn):
             continue
         try:
-            raw = list(fn())
-            if raw:
-                break
-        except Exception:
-            raw = []
-    keys_ordered = []
-    seen = set()
-    for x in raw:
-        _register_native_marker_shape(x)
-        try:
-            k = str(QgsSimpleMarkerSymbolLayer.encodeShape(x))
+            lst = list(fn())
+            if lst:
+                return lst
         except Exception:
             continue
-        if k and k not in seen:
-            seen.add(k)
-            keys_ordered.append(k)
-    if not keys_ordered:
-        return _fallback_shape_keys()
-    return _finalize_shape_key_order(keys_ordered) or _fallback_shape_keys()
+    return raw
 
 
-def _shape_preview_icon(shape, px):
+def _fallback_native_list():
+    """All built-in simple-marker shapes from enum members (always union with availableShapes on old QGIS)."""
+    out = []
+    if _HAVE_QGIS_MARKER_SHAPE:
+        try:
+            for x in Qgis.MarkerShape:
+                out.append(x)
+            if out:
+                return out
+        except Exception:
+            pass
+    classes = [QgsSimpleMarkerSymbolLayer]
+    try:
+        from qgis.core import QgsSimpleMarkerSymbolLayerBase as _B
+
+        classes.insert(0, _B)
+    except ImportError:
+        pass
+    seen_key = set()
+    for cls in classes:
+        for name in dir(cls):
+            if not name.startswith("Shape"):
+                continue
+            if name.startswith("ShapeIs") or name in ("Shape", "Shapes"):
+                continue
+            ev = getattr(cls, name, None)
+            if ev is None or inspect.isroutine(ev):
+                continue
+            k = _native_dedupe_key(ev)
+            if k in seen_key:
+                continue
+            seen_key.add(k)
+            out.append(ev)
+    return out
+
+
+def _preferred_native_order():
+    if _HAVE_QGIS_MARKER_SHAPE:
+        pref = []
+        for attr in ("Circle", "Square", "Diamond"):
+            v = getattr(Qgis.MarkerShape, attr, None)
+            if v is not None:
+                pref.append(v)
+        if pref:
+            return pref
+    pref = []
+    for name in ("ShapeCircle", "ShapeSquare", "ShapeDiamond"):
+        v = getattr(QgsSimpleMarkerSymbolLayer, name, None)
+        if v is not None:
+            pref.append(v)
+    return pref
+
+
+def _encode_sort_key(n):
+    try:
+        return str(QgsSimpleMarkerSymbolLayer.encodeShape(n))
+    except Exception:
+        return ""
+
+
+def _reorder_natives_preferred_first(natives):
+    if not natives:
+        return []
+    rest = list(natives)
+    head = []
+    for p in _preferred_native_order():
+        for i, n in enumerate(rest):
+            if _natives_semantically_equal(p, n):
+                head.append(n)
+                rest.pop(i)
+                break
+    rest.sort(key=lambda n: (_encode_sort_key(n), str(type(n)), id(n)))
+    return head + rest
+
+
+def _ordered_natives():
+    """Merge API list + static enums; dedupe without int-only keys (fixes single-square list on QGIS 3.6.1)."""
+    seen_key = set()
+    combined = []
+    for native in _available_shapes_raw() + _fallback_native_list():
+        if native is None:
+            continue
+        _register_native_marker_shape(native)
+        k = _native_dedupe_key(native)
+        if k in seen_key:
+            continue
+        seen_key.add(k)
+        combined.append(native)
+    ordered = _reorder_natives_preferred_first(combined)
+    out = ordered if ordered else combined
+    if not out:
+        for name in ("ShapeCircle", "ShapeSquare", "ShapeDiamond"):
+            v = getattr(QgsSimpleMarkerSymbolLayer, name, None)
+            if v is not None:
+                return [v]
+    return out
+
+
+def _find_native_index(natives, marker):
+    if marker is None or not natives:
+        return -1
+    for i, n in enumerate(natives):
+        if _natives_semantically_equal(marker, n):
+            return i
+    return -1
+
+
+def _shape_preview_icon_native(native, px):
+    if native is None:
+        return QIcon()
     try:
         sl = QgsSimpleMarkerSymbolLayer()
-        sl.setShape(coerce_marker_shape_for_setshape(shape))
+        sl.setShape(native)
         sl.setSize(4.5)
         sl.setSizeUnit(QgsUnitTypes.RenderMillimeters)
         sl.setColor(QColor(220, 220, 220))
@@ -568,6 +604,7 @@ class MarkerShapeCombo(QComboBox):
             self.setStyle(fusion)
         self.setStyleSheet(_qss_marker_combo_stylesheet())
         self._mw_grid_popup = None
+        self._mw_marker_natives = []
         self.rebuild_items()
 
     def changeEvent(self, event):
@@ -660,22 +697,37 @@ class MarkerShapeCombo(QComboBox):
         return max(160, min(max(room_below, room_above), ag.height() - 64))
 
     def rebuild_items(self):
-        shapes = _ordered_shape_keys()
-        prev = self.currentData(Qt.UserRole) if self.count() else None
+        prev_marker = None
+        if self.count() and self.currentIndex() >= 0:
+            idx = self.currentIndex()
+            olds = getattr(self, "_mw_marker_natives", None)
+            if olds and idx < len(olds):
+                prev_marker = olds[idx]
+            else:
+                d0 = self.currentData(Qt.UserRole)
+                if d0 is not None:
+                    prev_marker = coerce_marker_shape_for_setshape(d0)
+
+        natives = _ordered_natives()
+        self._mw_marker_natives = list(natives)
 
         px = _ICON_PIX
         self.blockSignals(True)
         self.clear()
         self.setIconSize(QSize(px, px))
-        self.setMaxVisibleItems(min(32, max(8, len(shapes))))
+        self.setMaxVisibleItems(min(32, max(8, len(natives))))
 
-        for i, sh in enumerate(shapes):
-            ic = _shape_preview_icon(sh, px)
+        for i, nat in enumerate(natives):
+            ic = _shape_preview_icon_native(nat, px)
             if ic.isNull():
                 ic = _placeholder_icon(px)
             self.addItem(ic, "")
-            self.setItemData(i, str(sh), Qt.UserRole)
-            self.setItemData(i, str(sh), Qt.ToolTipRole)
+            self.setItemData(i, i, Qt.UserRole)
+            try:
+                tip = str(QgsSimpleMarkerSymbolLayer.encodeShape(nat))
+            except Exception:
+                tip = ""
+            self.setItemData(i, tip or "", Qt.ToolTipRole)
 
         if hasattr(QComboBox, "Ignore"):
             self.setSizeAdjustPolicy(QComboBox.Ignore)
@@ -684,40 +736,54 @@ class MarkerShapeCombo(QComboBox):
         if self.count() == 0:
             ic = _placeholder_icon(px)
             self.addItem(ic, "")
-            pk = _preferred_shape_keys()
-            k0 = pk[0] if pk else "circle"
-            self.setItemData(0, k0, Qt.UserRole)
-            self.setItemData(0, k0, Qt.ToolTipRole)
+            fb = None
+            for name in ("ShapeCircle", "ShapeSquare", "ShapeDiamond"):
+                fb = getattr(QgsSimpleMarkerSymbolLayer, name, None)
+                if fb is not None:
+                    break
+            self._mw_marker_natives = [fb] if fb is not None else []
+            if self._mw_marker_natives:
+                self.setItemData(0, 0, Qt.UserRole)
+                try:
+                    self.setItemData(0, str(QgsSimpleMarkerSymbolLayer.encodeShape(fb)), Qt.ToolTipRole)
+                except Exception:
+                    self.setItemData(0, "", Qt.ToolTipRole)
 
-        if prev is None:
-            self.setCurrentIndex(0)
+        ipick = _find_native_index(self._mw_marker_natives, prev_marker)
+        if ipick >= 0:
+            self.setCurrentIndex(ipick)
         else:
-            self._select_shape_value(prev)
+            self.setCurrentIndex(0 if self.count() else -1)
 
         self.blockSignals(False)
 
     def _select_shape_value(self, value):
-        """Match combo row by encoded shape key (str), or any value coerce+encode can resolve."""
-        key = None
-        if isinstance(value, str):
-            key = value
-        else:
-            try:
-                coerced = coerce_marker_shape_for_setshape(value)
-                key = str(QgsSimpleMarkerSymbolLayer.encodeShape(coerced))
-            except Exception:
-                key = None
-        if not key:
-            self.setCurrentIndex(0)
-            return
-        for row in range(self.count()):
-            d = self.itemData(row, Qt.UserRole)
-            if d is None:
-                continue
-            if str(d) == str(key):
-                self.setCurrentIndex(row)
+        """Match combo row by stored index, encoded name, or native shape from the layer."""
+        natives = getattr(self, "_mw_marker_natives", ())
+        if isinstance(value, int) and not isinstance(value, bool):
+            if 0 <= value < len(natives):
+                self.setCurrentIndex(value)
                 return
-        self.setCurrentIndex(0)
+        if isinstance(value, str):
+            dec = _decode_shape_string(value)
+            if dec is not None:
+                j = _find_native_index(list(natives), dec)
+                if j >= 0:
+                    self.setCurrentIndex(j)
+                    return
+        j = _find_native_index(list(natives), value)
+        if j >= 0:
+            self.setCurrentIndex(j)
+            return
+        try:
+            coerced = coerce_marker_shape_for_setshape(value)
+            j = _find_native_index(list(natives), coerced)
+            if j >= 0:
+                self.setCurrentIndex(j)
+                return
+        except Exception:
+            pass
+        self.setCurrentIndex(0 if natives else -1)
 
     def clearShapeSelection(self):
         self.blockSignals(True)
@@ -729,6 +795,10 @@ class MarkerShapeCombo(QComboBox):
     def currentMarkerShape(self):
         if self.currentIndex() < 0:
             return None
+        idx = self.currentIndex()
+        natives = getattr(self, "_mw_marker_natives", ())
+        if 0 <= idx < len(natives):
+            return natives[idx]
         d = self.currentData(Qt.UserRole)
         if d is None:
             return None
