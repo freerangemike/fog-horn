@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Marker shape QComboBox: QGIS marker previews in a wrapping grid (custom popup — no Qt list scrollbar)."""
 
-import inspect
 import os
 
 from qgis.PyQt.QtCore import QEvent, QMetaObject, QPoint, QRect, QSize, Qt, pyqtSlot
@@ -38,6 +37,60 @@ _qss_combo_ss_cache = None
 _GRID_COLUMNS = 3
 _GRID_SPACING = 4
 _ICON_PIX = 34
+
+# decodeShape keys when sip ``dir()`` omits Shape* members on older builds.
+_FALLBACK_SHAPE_ENCODED_NAMES = (
+    "circle",
+    "square",
+    "diamond",
+    "rectangle",
+    "pentagon",
+    "hexagon",
+    "triangle",
+    "equilateral_triangle",
+    "arrow",
+    "arrowhead",
+    "filled_arrowhead",
+    "asterisk_fill",
+    "cross",
+    "cross2",
+    "cross_fill",
+    "line",
+    "heart",
+    "half_arc",
+    "half_square",
+    "quarter_arc",
+    "quarter_square",
+    "diagonal_half_square",
+    "decagon",
+    "octagon",
+    "left_half_triangle",
+    "right_half_triangle",
+    "parallelogram_left",
+    "parallelogram_right",
+    "semi_circle",
+    "third_circle",
+    "quarter_circle",
+    "left_half_circle",
+    "shield",
+    "regular_star",
+    "star_diamond",
+    "rounded_square",
+    "circle_cross",
+    "circle_cross_fill",
+    "saltire",
+    "sun",
+    "arrowhead_triangle",
+    "arrow_half",
+    "dart",
+    "flower",
+    "trefoil",
+    "four_leaf_clover",
+)
+# Sort key for markers not pulled to the preferred head — tuple order, not lexical.
+_CANONICAL_MARKER_ENC_ORDER = {name: i for i, name in enumerate(_FALLBACK_SHAPE_ENCODED_NAMES)}
+# QGIS 3.6 decodeShape: third_circle / quarter_circle (pie); half_arc/quarter_arc are newer names. left_half_circle → half_arc when HalfArc exists.
+_SHAPE_DECODE_FALLBACK = {"left_half_circle": "half_arc"}
 _POPUP_MIN_WIDTH_EXTRA = 28
 _POPUP_LIST_HEIGHT_FRACTION = 0.5
 
@@ -63,6 +116,9 @@ def _application_screen_at_global(pos):
 
 
 def _register_native_marker_shape(value):
+    # PyQGIS sip: decodeShape may return ``(Shape,)``; encode/setShape reject bare tuples.
+    while isinstance(value, tuple) and value:
+        value = value[0]
     try:
         _LEGACY_NATIVE_BY_INT[int(value)] = value
     except Exception:
@@ -93,6 +149,12 @@ def _decode_shape_string(name):
             return r[0]
         if r is not None:
             return r
+    alt = _SHAPE_DECODE_FALLBACK.get(name)
+    if alt:
+        v = _decode_shape_string(alt)
+        if v is not None:
+            _LEGACY_NATIVE_BY_ENCODED[name] = v
+        return v
     return None
 
 
@@ -172,46 +234,98 @@ def coerce_marker_shape_for_setshape(shape_like):
     """Value suitable for QgsSimpleMarkerSymbolLayer.setShape() / encodeShape on QGIS 3.x."""
     if shape_like is None:
         return None
+    if isinstance(shape_like, tuple) and shape_like:
+        return coerce_marker_shape_for_setshape(shape_like[0])
     if isinstance(shape_like, str):
         d = _decode_shape_string(shape_like)
         return d if d is not None else shape_like
+    if _HAVE_QGIS_MARKER_SHAPE and isinstance(shape_like, Qgis.MarkerShape):
+        return shape_like
     try:
         iv = int(shape_like)
     except (TypeError, ValueError):
         return shape_like
-    if _HAVE_QGIS_MARKER_SHAPE:
+    # Plain ``int`` from combo UserRole / storage → ``Qgis.MarkerShape`` when available.
+    # Sip ``QgsSimpleMarkerSymbolLayer`` / legacy enums: never cast arbitrary ``iv`` to
+    # ``Qgis.MarkerShape`` — ordinal schemes differ across namespaces.
+    if _HAVE_QGIS_MARKER_SHAPE and type(shape_like) is int:
         try:
             return Qgis.MarkerShape(iv)
         except Exception:
             pass
-    return _legacy_shape_value_from_int(iv)
+        return _legacy_shape_value_from_int(iv)
+    return shape_like
 
 
 def _native_dedupe_key(native):
-    """QGIS 3.6.1: int(sip enum) can collapse; encodeShape can return duplicates — fall back to object id."""
+    """Stable row identity for merging API + fallback lists (encode + ordinal, not ``id()``)."""
+    enc = ""
     try:
-        s = str(QgsSimpleMarkerSymbolLayer.encodeShape(native))
-        if s:
-            return ("e", s)
+        enc = str(QgsSimpleMarkerSymbolLayer.encodeShape(native))
     except Exception:
-        pass
-    return ("id", id(native))
+        enc = ""
+    try:
+        iv = int(native)
+    except Exception:
+        return ("mw_shape", enc, id(native))
+    return ("mw_shape", enc, iv)
 
 
 def _natives_semantically_equal(a, b):
+    """Match layer ``shape()`` to combo natives; never compare raw ints across enum namespaces."""
+
+    def _enc(x):
+        try:
+            return str(QgsSimpleMarkerSymbolLayer.encodeShape(x))
+        except Exception:
+            return ""
+
     if a is b:
         return True
+    ea, eb = _enc(a), _enc(b)
+    if ea and eb and ea == eb:
+        return True
+    ca = coerce_marker_shape_for_setshape(a)
+    cb = coerce_marker_shape_for_setshape(b)
+    if ca is cb:
+        return True
+    ea2, eb2 = _enc(ca), _enc(cb)
+    if ea2 and eb2 and ea2 == eb2:
+        return True
     try:
-        sa = str(QgsSimpleMarkerSymbolLayer.encodeShape(a))
-        sb = str(QgsSimpleMarkerSymbolLayer.encodeShape(b))
-        if sa and sb and sa == sb:
+        if type(ca) == type(cb) and int(ca) == int(cb):
             return True
     except Exception:
         pass
+    # QGIS < ~3.30: no unified Qgis.MarkerShape — ordinal is consistent for simple-marker sip values.
+    if not _HAVE_QGIS_MARKER_SHAPE:
+        try:
+            return int(ca) == int(cb)
+        except Exception:
+            pass
+    return False
+
+
+def _flatten_available_shapes_result(seq):
+    """Convert QList/sip sequence to Python list without ``list(seq)`` when it breaks enum wrapping."""
+    if seq is None:
+        return []
     try:
-        return int(a) == int(b)
+        n = len(seq)
+        return [seq[i] for i in range(n)]
     except Exception:
-        return False
+        pass
+    try:
+        return list(seq)
+    except Exception:
+        pass
+    out = []
+    try:
+        for x in seq:
+            out.append(x)
+    except Exception:
+        pass
+    return out
 
 
 def _available_shapes_raw():
@@ -228,11 +342,12 @@ def _available_shapes_raw():
         if not callable(fn):
             continue
         try:
-            lst = list(fn())
-            if lst:
-                return lst
+            lst = fn()
         except Exception:
             continue
+        flat = _flatten_available_shapes_result(lst)
+        if flat:
+            return flat
     return raw
 
 
@@ -262,13 +377,27 @@ def _fallback_native_list():
             if name.startswith("ShapeIs") or name in ("Shape", "Shapes"):
                 continue
             ev = getattr(cls, name, None)
-            if ev is None or inspect.isroutine(ev):
+            if ev is None:
+                continue
+            try:
+                int(ev)
+            except Exception:
                 continue
             k = _native_dedupe_key(ev)
             if k in seen_key:
                 continue
             seen_key.add(k)
             out.append(ev)
+    # Always supplement: ``dir(Shape*)`` often omits names still valid via ``decodeShape``.
+    for key in _FALLBACK_SHAPE_ENCODED_NAMES:
+        v = _decode_shape_string(key)
+        if v is None:
+            continue
+        dk = _native_dedupe_key(v)
+        if dk in seen_key:
+            continue
+        seen_key.add(dk)
+        out.append(v)
     return out
 
 
@@ -282,8 +411,15 @@ def _preferred_native_order():
         if pref:
             return pref
     pref = []
+    Base = None
+    try:
+        from qgis.core import QgsSimpleMarkerSymbolLayerBase as Base
+    except ImportError:
+        pass
     for name in ("ShapeCircle", "ShapeSquare", "ShapeDiamond"):
-        v = getattr(QgsSimpleMarkerSymbolLayer, name, None)
+        v = getattr(Base, name, None) if Base is not None else None
+        if v is None:
+            v = getattr(QgsSimpleMarkerSymbolLayer, name, None)
         if v is not None:
             pref.append(v)
     return pref
@@ -307,15 +443,25 @@ def _reorder_natives_preferred_first(natives):
                 head.append(n)
                 rest.pop(i)
                 break
-    rest.sort(key=lambda n: (_encode_sort_key(n), str(type(n)), id(n)))
+    _rank_n = len(_CANONICAL_MARKER_ENC_ORDER)
+    rest.sort(
+        key=lambda n: (
+            _CANONICAL_MARKER_ENC_ORDER.get(_encode_sort_key(n), _rank_n),
+            _encode_sort_key(n),
+            str(type(n)),
+            id(n),
+        )
+    )
     return head + rest
 
 
 def _ordered_natives():
-    """Merge API list + static enums; dedupe without int-only keys (fixes single-square list on QGIS 3.6.1)."""
+    """Merge API list + static enums; dedupe by (encode, ordinal) so QGIS order is kept without duplicate rows."""
+    raw_api = _available_shapes_raw()
+    raw_fb = _fallback_native_list()
     seen_key = set()
     combined = []
-    for native in _available_shapes_raw() + _fallback_native_list():
+    for native in raw_api + raw_fb:
         if native is None:
             continue
         _register_native_marker_shape(native)
@@ -346,23 +492,39 @@ def _find_native_index(natives, marker):
 def _shape_preview_icon_native(native, px):
     if native is None:
         return QIcon()
+    candidates = []
+    for c in (native, coerce_marker_shape_for_setshape(native)):
+        if c is None:
+            continue
+        if c not in candidates:
+            candidates.append(c)
     try:
-        sl = QgsSimpleMarkerSymbolLayer()
-        sl.setShape(native)
-        sl.setSize(4.5)
-        sl.setSizeUnit(QgsUnitTypes.RenderMillimeters)
-        sl.setColor(QColor(220, 220, 220))
-        sl.setStrokeColor(QColor(35, 35, 35))
-        sl.setStrokeStyle(Qt.SolidLine)
-        sl.setStrokeWidth(0.25)
-        sl.setStrokeWidthUnit(QgsUnitTypes.RenderMillimeters)
-        sym = QgsMarkerSymbol()
-        sym.appendSymbolLayer(sl)
-        pm = QgsSymbolLayerUtils.symbolPreviewPixmap(sym, QSize(max(8, px), max(8, px)), 2)
-        if pm is not None and not pm.isNull():
-            return QIcon(pm)
+        if not (_HAVE_QGIS_MARKER_SHAPE and isinstance(native, Qgis.MarkerShape)):
+            lv = _legacy_shape_value_from_int(int(native))
+            if lv not in candidates:
+                candidates.append(lv)
     except Exception:
         pass
+    for shaped in candidates:
+        try:
+            sl = QgsSimpleMarkerSymbolLayer()
+            sl.setShape(shaped)
+            sl.setSize(4.5)
+            sl.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+            sl.setColor(QColor(220, 220, 220))
+            sl.setStrokeColor(QColor(35, 35, 35))
+            sl.setStrokeStyle(Qt.SolidLine)
+            sl.setStrokeWidth(0.25)
+            sl.setStrokeWidthUnit(QgsUnitTypes.RenderMillimeters)
+            sym = QgsMarkerSymbol()
+            while sym.symbolLayerCount() > 0:
+                sym.deleteSymbolLayer(0)
+            sym.appendSymbolLayer(sl)
+            pm = QgsSymbolLayerUtils.symbolPreviewPixmap(sym, QSize(max(8, px), max(8, px)), 2)
+            if pm is not None and not pm.isNull():
+                return QIcon(pm)
+        except Exception:
+            continue
     return QIcon()
 
 
@@ -662,7 +824,11 @@ class MarkerShapeCombo(QComboBox):
             pm = saved_icon.pixmap(sz)
         if pm is None or pm.isNull():
             return
-        target = QRect(0, 0, sz.width(), sz.height())
+        max_w = max(1, min(sz.width(), field.width() - 2))
+        max_h = max(1, min(sz.height(), field.height() - 2))
+        if pm.width() > max_w or pm.height() > max_h or pm.devicePixelRatio() > 1.01:
+            pm = pm.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        target = QRect(0, 0, pm.width(), pm.height())
         target.moveCenter(field.center())
         if not self.isEnabled():
             painter.setOpacity(0.55)
@@ -706,7 +872,10 @@ class MarkerShapeCombo(QComboBox):
             else:
                 d0 = self.currentData(Qt.UserRole)
                 if d0 is not None:
-                    prev_marker = coerce_marker_shape_for_setshape(d0)
+                    if isinstance(d0, int) and olds is not None and 0 <= d0 < len(olds):
+                        prev_marker = olds[d0]
+                    else:
+                        prev_marker = coerce_marker_shape_for_setshape(d0)
 
         natives = _ordered_natives()
         self._mw_marker_natives = list(natives)
@@ -756,34 +925,52 @@ class MarkerShapeCombo(QComboBox):
             self.setCurrentIndex(0 if self.count() else -1)
 
         self.blockSignals(False)
+        self.update()
 
     def _select_shape_value(self, value):
-        """Match combo row by stored index, encoded name, or native shape from the layer."""
+        """Match combo row by encoded name or native shape from the layer.
+
+        ``sl.shape()`` may return a bare Python ``int`` (ordinal), which must not be treated as a combo row index.
+        """
         natives = getattr(self, "_mw_marker_natives", ())
-        if isinstance(value, int) and not isinstance(value, bool):
-            if 0 <= value < len(natives):
-                self.setCurrentIndex(value)
-                return
+
+        def _pick(idx):
+            self.setCurrentIndex(idx)
+            self.update()
+
         if isinstance(value, str):
             dec = _decode_shape_string(value)
             if dec is not None:
                 j = _find_native_index(list(natives), dec)
                 if j >= 0:
-                    self.setCurrentIndex(j)
+                    _pick(j)
                     return
         j = _find_native_index(list(natives), value)
         if j >= 0:
-            self.setCurrentIndex(j)
+            _pick(j)
             return
         try:
             coerced = coerce_marker_shape_for_setshape(value)
             j = _find_native_index(list(natives), coerced)
             if j >= 0:
-                self.setCurrentIndex(j)
+                _pick(j)
                 return
         except Exception:
             pass
-        self.setCurrentIndex(0 if natives else -1)
+        target_enc = ""
+        try:
+            target_enc = str(QgsSimpleMarkerSymbolLayer.encodeShape(coerce_marker_shape_for_setshape(value)))
+        except Exception:
+            target_enc = ""
+        if target_enc:
+            for i, n in enumerate(natives):
+                try:
+                    if str(QgsSimpleMarkerSymbolLayer.encodeShape(n)) == target_enc:
+                        _pick(i)
+                        return
+                except Exception:
+                    continue
+        _pick(0 if natives else -1)
 
     def clearShapeSelection(self):
         self.blockSignals(True)
@@ -791,6 +978,7 @@ class MarkerShapeCombo(QComboBox):
             self.setCurrentIndex(-1)
         finally:
             self.blockSignals(False)
+        self.update()
 
     def currentMarkerShape(self):
         if self.currentIndex() < 0:
@@ -802,6 +990,8 @@ class MarkerShapeCombo(QComboBox):
         d = self.currentData(Qt.UserRole)
         if d is None:
             return None
+        if isinstance(d, int) and 0 <= d < len(natives):
+            return natives[d]
         return coerce_marker_shape_for_setshape(d)
 
     def setCurrentMarkerShape(self, shape):

@@ -1067,6 +1067,30 @@ class MapestryPlugin:
 
     def openLayerSymbologyProperties(self):
         """Open Layer Properties on the Symbology tab for the layer selected in the dock panel."""
+        def _mw_dbg_evt(hypothesis_id, message, data):
+            try:
+                import json
+                import os
+                import time
+
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-068cb0.log")
+                line = json.dumps(
+                    {
+                        "sessionId": "068cb0",
+                        "runId": "pre-fix",
+                        "hypothesisId": hypothesis_id,
+                        "location": "map_weaver.py:openLayerSymbologyProperties",
+                        "message": message,
+                        "data": data or {},
+                        "timestamp": int(time.time() * 1000),
+                    },
+                    default=str,
+                ) + "\n"
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
+
         layer = None
         if self.dockwidget is not None and hasattr(self.dockwidget, "selectedLayerFromPanel"):
             layer = self.dockwidget.selectedLayerFromPanel()
@@ -1095,7 +1119,47 @@ class MapestryPlugin:
         except ImportError:
             pass
 
-        self.iface.showLayerProperties(layer, page)
+        # #region agent log
+        _mw_dbg_evt(
+            "LP1",
+            "before showLayerProperties",
+            {
+                "layer_type": type(layer).__name__,
+                "page": page,
+                "iface_type": type(self.iface).__name__,
+                "has_showLayerProperties": hasattr(self.iface, "showLayerProperties"),
+            },
+        )
+        # #endregion
+        try:
+            self.iface.showLayerProperties(layer, page)
+            # #region agent log
+            _mw_dbg_evt("LP2", "showLayerProperties two-arg succeeded", {"page": page})
+            # #endregion
+            return
+        except TypeError as ex:
+            # #region agent log
+            _mw_dbg_evt(
+                "LP3",
+                "showLayerProperties two-arg failed",
+                {"page": page, "error": str(ex), "error_type": type(ex).__name__},
+            )
+            # #endregion
+            try:
+                self.iface.showLayerProperties(layer)
+                # #region agent log
+                _mw_dbg_evt("LP4", "showLayerProperties one-arg fallback succeeded", {})
+                # #endregion
+                return
+            except Exception as ex2:
+                # #region agent log
+                _mw_dbg_evt(
+                    "LP5",
+                    "showLayerProperties one-arg fallback failed",
+                    {"error": str(ex2), "error_type": type(ex2).__name__},
+                )
+                # #endregion
+                raise
 
     def _densestLayerVertexCenter(self, layer):
         """Return center point of the densest vertex bin."""
@@ -1418,11 +1482,21 @@ class MapestryPlugin:
         if hasattr(cmb, "currentMarkerShape"):
             shape = cmb.currentMarkerShape()
         else:
-            d = cmb.currentData(Qt.UserRole)
-            if d is not None:
-                try:
-                    shape = coerce_marker_shape_for_setshape(d)
-                except Exception:
+            idx = cmb.currentIndex()
+            natives = getattr(cmb, "_mw_marker_natives", ())
+            if 0 <= idx < len(natives):
+                shape = natives[idx]
+            else:
+                d = cmb.currentData(Qt.UserRole)
+                if d is not None:
+                    try:
+                        if isinstance(d, int) and 0 <= d < len(natives):
+                            shape = natives[d]
+                        else:
+                            shape = coerce_marker_shape_for_setshape(d)
+                    except Exception:
+                        shape = None
+                else:
                     shape = None
         if shape is None:
             return
